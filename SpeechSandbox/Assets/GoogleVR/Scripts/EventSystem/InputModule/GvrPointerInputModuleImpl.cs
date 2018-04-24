@@ -11,12 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System;
 using UnityEngine;
 using UnityEngine.EventSystems;
 
-#if UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_EDITOR)
-using UnityEngine.VR;
-#endif  // UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_EDITOR)
+#if UNITY_2017_2_OR_NEWER
+using UnityEngine.XR;
+#else
+using XRSettings = UnityEngine.VR.VRSettings;
+#endif  // UNITY_2017_2_OR_NEWER
 
 /// Implementation of _GvrPointerInputModule_
 public class GvrPointerInputModuleImpl {
@@ -34,12 +37,26 @@ public class GvrPointerInputModuleImpl {
   /// The GvrPointerScrollInput used to route Scroll Events through _EventSystem_
   public GvrPointerScrollInput ScrollInput { get; set; }
 
-  /// The GvrBasePointer which will be responding to pointer events.
-  public GvrBasePointer Pointer { get; set; }
-
   /// PointerEventData from the most recent frame.
   public PointerEventData CurrentEventData { get; private set; }
 
+  /// The GvrBasePointer which will be responding to pointer events.
+  public GvrBasePointer Pointer {
+    get {
+      return pointer;
+    }
+    set {
+      if (pointer == value) {
+        return;
+      }
+
+      TryExitPointer();
+
+      pointer = value;
+    }
+  }
+
+  private GvrBasePointer pointer;
   private Vector2 lastPose;
   private bool isPointerHovering = false;
 
@@ -48,28 +65,19 @@ public class GvrPointerInputModuleImpl {
 
   public bool ShouldActivateModule() {
     bool isVrModeEnabled = !VrModeOnly;
-#if UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_EDITOR)
-    isVrModeEnabled |= UnityEngine.XR.XRSettings.enabled;
-#endif  // UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_EDITOR)
+    isVrModeEnabled |= XRSettings.enabled;
 
     bool activeState = ModuleController.ShouldActivate() && isVrModeEnabled;
 
     if (activeState != isActive) {
       isActive = activeState;
-
-      // Activate pointer
-      if (Pointer != null) {
-        if (isActive) {
-          Pointer.OnInputModuleEnabled();
-        }
-      }
     }
 
     return activeState;
   }
 
   public void DeactivateModule() {
-    DisablePointer();
+    TryExitPointer();
     ModuleController.Deactivate();
     if (CurrentEventData != null) {
       HandlePendingClick();
@@ -84,8 +92,9 @@ public class GvrPointerInputModuleImpl {
   }
 
   public void Process() {
-    if (Pointer == null) {
-      return;
+    // If the pointer is inactive, make sure it is exited if necessary.
+    if (!IsPointerActiveAndAvailable()) {
+      TryExitPointer();
     }
 
     // Save the previous Game Object
@@ -118,14 +127,14 @@ public class GvrPointerInputModuleImpl {
       HandlePendingClick();
     }
 
-    ScrollInput.HandleScroll(GetCurrentGameObject(), CurrentEventData, IsPointerActiveAndAvailable());
+    ScrollInput.HandleScroll(GetCurrentGameObject(), CurrentEventData, Pointer, EventExecutor);
   }
 
   private void CastRay() {
-    if (Pointer == null || Pointer.PointerTransform == null) {
-      return;
+    Vector2 currentPose = lastPose;
+    if (IsPointerActiveAndAvailable()) {
+      currentPose = GvrMathHelpers.NormalizedCartesianToSpherical(Pointer.PointerTransform.forward);
     }
-    Vector2 currentPose = GvrMathHelpers.NormalizedCartesianToSpherical(Pointer.PointerTransform.forward);
 
     if (CurrentEventData == null) {
       CurrentEventData = new PointerEventData(ModuleController.eventSystem);
@@ -136,7 +145,7 @@ public class GvrPointerInputModuleImpl {
     RaycastResult previousRaycastResult = CurrentEventData.pointerCurrentRaycast;
 
     // The initial cast must use the enter radius.
-    if (Pointer != null) {
+    if (IsPointerActiveAndAvailable()) {
       Pointer.ShouldUseExitRadiusForRaycast = false;
     }
 
@@ -145,10 +154,10 @@ public class GvrPointerInputModuleImpl {
     // Set the position to the center of the camera.
     // This is only necessary if using the built-in Unity raycasters.
     RaycastResult raycastResult;
-    CurrentEventData.position = GvrMathHelpers.GetViewportCenter();
+    CurrentEventData.position = GvrVRHelpers.GetViewportCenter();
     bool isPointerActiveAndAvailable = IsPointerActiveAndAvailable();
     if (isPointerActiveAndAvailable) {
-      ModuleController.eventSystem.RaycastAll(CurrentEventData, ModuleController.RaycastResultCache);
+      RaycastAll();
       raycastResult = ModuleController.FindFirstRaycast(ModuleController.RaycastResultCache);
     } else {
       raycastResult = new RaycastResult();
@@ -160,11 +169,8 @@ public class GvrPointerInputModuleImpl {
     if (previousRaycastResult.gameObject != null
         && raycastResult.gameObject != previousRaycastResult.gameObject
         && isPointerActiveAndAvailable) {
-      if (Pointer != null) {
-        Pointer.ShouldUseExitRadiusForRaycast = true;
-      }
-      ModuleController.RaycastResultCache.Clear();
-      ModuleController.eventSystem.RaycastAll(CurrentEventData, ModuleController.RaycastResultCache);
+      Pointer.ShouldUseExitRadiusForRaycast = true;
+      RaycastAll();
       RaycastResult firstResult = ModuleController.FindFirstRaycast(ModuleController.RaycastResultCache);
       if (firstResult.gameObject == previousRaycastResult.gameObject) {
         raycastResult = firstResult;
@@ -182,15 +188,9 @@ public class GvrPointerInputModuleImpl {
     // Based on the results of the hit and the state of the pointerData.
     if (raycastResult.gameObject != null) {
       CurrentEventData.position = raycastResult.screenPosition;
-    } else {
-      Transform pointerTransform = Pointer.PointerTransform;
-      float maxPointerDistance = Pointer.MaxPointerDistance;
-      Vector3 pointerPos = pointerTransform.position + (pointerTransform.forward * maxPointerDistance);
-      if (CurrentEventData.pressEventCamera != null) {
-        CurrentEventData.position = CurrentEventData.pressEventCamera.WorldToScreenPoint(pointerPos);
-      } else if (Camera.main != null) {
-        CurrentEventData.position = Camera.main.WorldToScreenPoint(pointerPos);
-      }
+    } else if (IsPointerActiveAndAvailable() && CurrentEventData.enterEventCamera != null) {
+      Vector3 pointerPos = Pointer.MaxPointerEndPoint;
+      CurrentEventData.position = CurrentEventData.enterEventCamera.WorldToScreenPoint(pointerPos);
     }
 
     ModuleController.RaycastResultCache.Clear();
@@ -208,7 +208,7 @@ public class GvrPointerInputModuleImpl {
   }
 
   private void UpdateCurrentObject(GameObject previousObject) {
-    if (Pointer == null || CurrentEventData == null) {
+    if (CurrentEventData == null) {
       return;
     }
     // Send enter events and update the highlight.
@@ -231,28 +231,35 @@ public class GvrPointerInputModuleImpl {
   }
 
   private void UpdatePointer(GameObject previousObject) {
-    if (Pointer == null || CurrentEventData == null) {
+    if (CurrentEventData == null) {
       return;
     }
 
     GameObject currentObject = GetCurrentGameObject(); // Get the pointer target
+    bool isPointerActiveAndAvailable = IsPointerActiveAndAvailable();
 
     bool isInteractive = CurrentEventData.pointerPress != null ||
                          EventExecutor.GetEventHandler<IPointerClickHandler>(currentObject) != null ||
                          EventExecutor.GetEventHandler<IDragHandler>(currentObject) != null;
 
     if (isPointerHovering && currentObject != null && currentObject == previousObject) {
-      Pointer.OnPointerHover(CurrentEventData.pointerCurrentRaycast, GetLastRay(), isInteractive);
+      if (isPointerActiveAndAvailable) {
+        Pointer.OnPointerHover(CurrentEventData.pointerCurrentRaycast, isInteractive);
+      }
     } else {
       // If the object's don't match or the hovering object has been destroyed
       // then the pointer has exited.
       if (previousObject != null || (currentObject == null && isPointerHovering)) {
-        Pointer.OnPointerExit(previousObject);
+        if (isPointerActiveAndAvailable) {
+          Pointer.OnPointerExit(previousObject);
+        }
         isPointerHovering = false;
       }
 
       if (currentObject != null) {
-        Pointer.OnPointerEnter(CurrentEventData.pointerCurrentRaycast, GetLastRay(), isInteractive);
+        if (isPointerActiveAndAvailable) {
+          Pointer.OnPointerEnter(CurrentEventData.pointerCurrentRaycast, isInteractive);
+        }
         isPointerHovering = true;
       }
     }
@@ -299,7 +306,7 @@ public class GvrPointerInputModuleImpl {
       return;
     }
 
-    if (Pointer != null) {
+    if (IsPointerActiveAndAvailable()) {
       Pointer.OnPointerClickUp();
     }
 
@@ -313,19 +320,21 @@ public class GvrPointerInputModuleImpl {
       EventExecutor.Execute(CurrentEventData.pointerPress, CurrentEventData, ExecuteEvents.pointerClickHandler);
     }
 
-    if (CurrentEventData.pointerDrag != null && CurrentEventData.dragging) {
+    if (CurrentEventData != null && CurrentEventData.pointerDrag != null && CurrentEventData.dragging) {
       EventExecutor.ExecuteHierarchy(go, CurrentEventData, ExecuteEvents.dropHandler);
       EventExecutor.Execute(CurrentEventData.pointerDrag, CurrentEventData, ExecuteEvents.endDragHandler);
     }
 
-    // Clear the click state.
-    CurrentEventData.pointerPress = null;
-    CurrentEventData.rawPointerPress = null;
-    CurrentEventData.eligibleForClick = false;
-    CurrentEventData.clickCount = 0;
-    CurrentEventData.clickTime = 0;
-    CurrentEventData.pointerDrag = null;
-    CurrentEventData.dragging = false;
+    if (CurrentEventData != null) {
+      // Clear the click state.
+      CurrentEventData.pointerPress = null;
+      CurrentEventData.rawPointerPress = null;
+      CurrentEventData.eligibleForClick = false;
+      CurrentEventData.clickCount = 0;
+      CurrentEventData.clickTime = 0;
+      CurrentEventData.pointerDrag = null;
+      CurrentEventData.dragging = false;
+    }
   }
 
   private void HandleTriggerDown() {
@@ -353,23 +362,18 @@ public class GvrPointerInputModuleImpl {
       EventExecutor.Execute(CurrentEventData.pointerDrag, CurrentEventData, ExecuteEvents.initializePotentialDrag);
     }
 
-    if (Pointer != null) {
+    if (IsPointerActiveAndAvailable()) {
       Pointer.OnPointerClickDown();
     }
   }
 
-  public GameObject GetCurrentGameObject() {
+  private GameObject GetCurrentGameObject() {
     if (CurrentEventData != null) {
       return CurrentEventData.pointerCurrentRaycast.gameObject;
     }
 
     return null;
   }
-
-  public GameObject getObject()
-    {
-        return GetCurrentGameObject();
-    }
 
   // Modified version of BaseInputModule.HandlePointerExitAndEnter that calls EventExecutor instead of
   // UnityEngine.EventSystems.ExecuteEvents.
@@ -427,21 +431,7 @@ public class GvrPointerInputModuleImpl {
     }
   }
 
-  private Ray GetLastRay() {
-    if (CurrentEventData != null) {
-      GvrBasePointerRaycaster raycaster = CurrentEventData.pointerCurrentRaycast.module as GvrBasePointerRaycaster;
-      if (raycaster != null) {
-        return raycaster.GetLastRay();
-      } else if (CurrentEventData.enterEventCamera != null) {
-        Camera cam = CurrentEventData.enterEventCamera;
-        return new Ray(cam.transform.position, cam.transform.forward);
-      }
-    }
-
-    return new Ray();
-  }
-
-  private void DisablePointer() {
+  private void TryExitPointer() {
     if (Pointer == null) {
       return;
     }
@@ -450,20 +440,14 @@ public class GvrPointerInputModuleImpl {
     if (currentGameObject) {
       Pointer.OnPointerExit(currentGameObject);
     }
-
-    Pointer.OnInputModuleDisabled();
   }
 
   private bool IsPointerActiveAndAvailable() {
-    if (Pointer == null) {
-      return false;
-    }
+    return pointer != null && pointer.IsAvailable;
+  }
 
-    Transform pointerTransform = Pointer.PointerTransform;
-    if (pointerTransform == null) {
-      return false;
-    }
-
-    return pointerTransform.gameObject.activeInHierarchy;
+  private void RaycastAll() {
+    ModuleController.RaycastResultCache.Clear();
+    ModuleController.eventSystem.RaycastAll(CurrentEventData, ModuleController.RaycastResultCache);
   }
 }

@@ -17,7 +17,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application android:icon="@drawable/app_icon"
                  android:label="@string/app_name">
-        <activity android:name="com.google.unity.GoogleUnityActivity"
+        <activity android:name="com.google.unity.UnityPlayerActivity"
                   android:label="@string/app_name"
                   android:screenOrientation="landscape"
                   android:launchMode="singleTask"
@@ -32,14 +32,13 @@
         <meta-data android:name="IMMERSIVE_MODE" android:value="true" />
     </application>
     <!-- Set target sdk version to Lollipop to prevent issues with Marshmallow's runtime permissions. -->
-    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="23" />
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="24" />
     <uses-feature android:glEsVersion="0x00020000" />
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true"/>
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true"/>
     <uses-permission android:name="android.permission.NFC"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- VR feature tags. -->
     <uses-feature android:name="android.software.vr.mode" android:required="false"/>

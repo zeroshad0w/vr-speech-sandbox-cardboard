@@ -20,86 +20,140 @@ using Gvr.Internal;
 
 /// Provides mouse-controlled head tracking emulation in the Unity editor.
 public class GvrEditorEmulator : MonoBehaviour {
-  // Simulated neck model.  Vector from the neck pivot point to the point between the eyes.
-  private static readonly Vector3 m_neckOffset = new Vector3(0, 0.075f, 0.08f);
+  // GvrEditorEmulator should only be compiled in the Editor.
+  //
+  // Otherwise, it will override the camera pose every frame on device which causes the
+  // following behaviour:
+  //
+  // The rendered camera pose will still be correct because the VR.InputTracking pose
+  // gets applied after LateUpdate has occured. However, any functionality that
+  // queries the camera pose during Update or LateUpdate after GvrEditorEmulator has been
+  // updated will get the wrong value applied by GvrEditorEmulator intsead.
+#if UNITY_EDITOR
+  public static GvrEditorEmulator Instance { get; private set; }
 
   private const string AXIS_MOUSE_X = "Mouse X";
   private const string AXIS_MOUSE_Y = "Mouse Y";
 
+  // Simulated neck model.  Vector from the neck pivot point to the point between the eyes.
+  private static readonly Vector3 NECK_OFFSET = new Vector3(0, 0.075f, 0.08f);
+
   // Use mouse to emulate head in the editor.
   // These variables must be static so that head pose is maintained between scene changes,
   // as it is on device.
-  private static float m_mouseX = 0;
-  private static float m_mouseY = 0;
-  private static float m_mouseZ = 0;
+  private float mouseX = 0;
+  private float mouseY = 0;
+  private float mouseZ = 0;
 
-  private bool m_isRecenterOnlyController = false;
+  public Vector3 HeadPosition { get; private set; }
+  public Quaternion HeadRotation { get; private set; }
 
-  [Tooltip("Camera to track")]
-  public Camera m_camera;
+  public void Recenter() {
+    mouseX = mouseZ = 0;  // Do not reset pitch, which is how it works on the phone.
+    UpdateHeadPositionAndRotation();
 
-#if UNITY_EDITOR && UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_IOS)
-  void Start()
-  {
-    GvrRecenterOnlyController controllerOnlyRecenter =
-      FindObjectOfType<GvrRecenterOnlyController>();
-    if (controllerOnlyRecenter != null)
-    {
-      m_isRecenterOnlyController = true;
-    }
-    if (m_camera == null)
-    {
-      m_camera = Camera.main;
+    IEnumerator<Camera> validCameras = ValidCameras();
+    while (validCameras.MoveNext()) {
+      Camera cam = validCameras.Current;
+      cam.transform.localPosition = HeadPosition * cam.transform.lossyScale.y;
+      cam.transform.localRotation = HeadRotation;
     }
   }
 
-  void Update()
-  {
-    if (GvrController.Recentered)
-    {
+  public void UpdateEditorEmulation() {
+    if (GvrControllerInput.Recentered) {
       Recenter();
     }
 
-    Quaternion rot;
     bool rolled = false;
-    if (Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt)) {
-      m_mouseX += Input.GetAxis(AXIS_MOUSE_X) * 5;
-      if (m_mouseX <= -180) {
-        m_mouseX += 360;
-      } else if (m_mouseX > 180) {
-        m_mouseX -= 360;
+    if (CanChangeYawPitch()) {
+      GvrCursorHelper.HeadEmulationActive = true;
+      mouseX += Input.GetAxis(AXIS_MOUSE_X) * 5;
+      if (mouseX <= -180) {
+        mouseX += 360;
+      } else if (mouseX > 180) {
+        mouseX -= 360;
       }
-      m_mouseY -= Input.GetAxis(AXIS_MOUSE_Y) * 2.4f;
-      m_mouseY = Mathf.Clamp(m_mouseY, -85, 85);
-    } else if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) {
+      mouseY -= Input.GetAxis(AXIS_MOUSE_Y) * 2.4f;
+      mouseY = Mathf.Clamp(mouseY, -85, 85);
+    } else if (CanChangeRoll()) {
+      GvrCursorHelper.HeadEmulationActive = true;
       rolled = true;
-      m_mouseZ += Input.GetAxis(AXIS_MOUSE_X) * 5;
-      m_mouseZ = Mathf.Clamp(m_mouseZ, -85, 85);
+      mouseZ += Input.GetAxis(AXIS_MOUSE_X) * 5;
+      mouseZ = Mathf.Clamp(mouseZ, -85, 85);
+    } else {
+      GvrCursorHelper.HeadEmulationActive = false;
     }
+
     if (!rolled) {
       // People don't usually leave their heads tilted to one side for long.
-      m_mouseZ = Mathf.Lerp(m_mouseZ, 0, Time.deltaTime / (Time.deltaTime + 0.1f));
+      mouseZ = Mathf.Lerp(mouseZ, 0, Time.deltaTime / (Time.deltaTime + 0.1f));
     }
-    rot = Quaternion.Euler(m_mouseY, m_mouseX, m_mouseZ);
-    var neck = (rot * m_neckOffset - m_neckOffset.y * Vector3.up) * m_camera.transform.lossyScale.y;
 
-    Vector3 camPosition = m_camera.transform.position;
-    camPosition.y = neck.y;
-    m_camera.transform.localPosition = neck;
-    m_camera.transform.localRotation = rot;
+    UpdateHeadPositionAndRotation();
+
+    IEnumerator<Camera> validCameras = ValidCameras();
+    while (validCameras.MoveNext()) {
+      Camera cam = validCameras.Current;
+      cam.transform.localPosition = HeadPosition * cam.transform.lossyScale.y;
+      cam.transform.localRotation = HeadRotation;
+    }
   }
-#endif  // UNITY_EDITOR && UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_IOS)
 
-  public void Recenter()
-  {
-#if UNITY_EDITOR && UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_IOS)
-    if (m_isRecenterOnlyController)
-    {
+  void Awake() {
+    if (Instance != null) {
+      Debug.LogError("More than one GvrEditorEmulator instance was found in your scene. "
+        + "Ensure that there is only one GvrEditorEmulator.");
+      this.enabled = false;
       return;
     }
-    m_mouseX = m_mouseZ = 0;  // Do not reset pitch, which is how it works on the phone.
-    m_camera.transform.localPosition = Vector3.zero;
-    m_camera.transform.localRotation = new Quaternion(m_mouseX, m_mouseY, m_mouseZ, 1);
-#endif  // UNITY_EDITOR && UNITY_HAS_GOOGLEVR && (UNITY_ANDROID || UNITY_IOS)
+    Instance = this;
   }
+
+  void Update() {
+    // GvrControllerInput automatically updates GvrEditorEmulator.
+    // This guarantees that GvrEditorEmulator is updated before anything else responds to
+    // controller input, which ensures that re-centering works correctly in the editor.
+    // If GvrControllerInput is not available, then fallback to using Update().
+    if (GvrControllerInput.ApiStatus != GvrControllerApiStatus.Error) {
+      return;
+    }
+
+    UpdateEditorEmulation();
+  }
+
+  private bool CanChangeYawPitch() {
+    // If the MouseControllerProvider is currently active, then don't move the camera.
+    if (MouseControllerProvider.IsActivateButtonPressed) {
+      return false;
+    }
+
+    return Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+  }
+
+  private bool CanChangeRoll() {
+    // If the MouseControllerProvider is currently active, then don't move the camera.
+    if (MouseControllerProvider.IsActivateButtonPressed) {
+      return false;
+    }
+
+    return Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+  }
+
+  private void UpdateHeadPositionAndRotation() {
+    HeadRotation = Quaternion.Euler(mouseY, mouseX, mouseZ);
+    HeadPosition = HeadRotation * NECK_OFFSET - NECK_OFFSET.y * Vector3.up;
+  }
+
+  private IEnumerator<Camera> ValidCameras() {
+    for (int i = 0; i < Camera.allCameras.Length; i++) {
+      Camera cam = Camera.allCameras[i];
+      if (!cam.enabled || cam.stereoTargetEye == StereoTargetEyeMask.None) {
+        continue;
+      }
+
+      yield return cam;
+    }
+  }
+#endif  // UNITY_EDITOR
 }
